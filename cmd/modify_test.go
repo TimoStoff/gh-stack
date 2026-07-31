@@ -532,7 +532,7 @@ func TestCheckModifyPreconditions_NotInteractive(t *testing.T) {
 	restore := git.SetOps(mock)
 	defer restore()
 
-	_, err := checkModifyPreconditions(cfg)
+	_, err := checkModifyPreconditions(cfg, true)
 	cfg.Out.Close()
 	cfg.Err.Close()
 	assert.Error(t, err)
@@ -561,7 +561,7 @@ func TestCheckModifyPreconditions_RebaseInProgress(t *testing.T) {
 	cfg, _, _ := config.NewTestConfig()
 	cfg.ForceInteractive = true
 
-	_, err := checkModifyPreconditions(cfg)
+	_, err := checkModifyPreconditions(cfg, true)
 	cfg.Out.Close()
 	cfg.Err.Close()
 	assert.ErrorIs(t, err, ErrRebaseActive)
@@ -590,7 +590,7 @@ func TestCheckModifyPreconditions_DirtyWorkingTree(t *testing.T) {
 	cfg, _, _ := config.NewTestConfig()
 	cfg.ForceInteractive = true
 
-	_, err := checkModifyPreconditions(cfg)
+	_, err := checkModifyPreconditions(cfg, true)
 	cfg.Out.Close()
 	cfg.Err.Close()
 	assert.Error(t, err)
@@ -628,7 +628,7 @@ func TestCheckModifyPreconditions_AllPass(t *testing.T) {
 		},
 	}
 
-	result, err := checkModifyPreconditions(cfg)
+	result, err := checkModifyPreconditions(cfg, true)
 	cfg.Out.Close()
 	cfg.Err.Close()
 	assert.NoError(t, err)

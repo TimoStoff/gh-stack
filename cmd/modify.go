@@ -15,8 +15,9 @@ import (
 )
 
 type modifyOptions struct {
-	abort bool
-	cont  bool
+	abort    bool
+	cont     bool
+	planFile string
 }
 
 func ModifyCmd(cfg *config.Config) *cobra.Command {
@@ -44,7 +45,11 @@ afterward to push changes, update PRs, and recreate the stack on GitHub.`,
   $ gh stack modify --abort
 
   # Continue after resolving conflicts from a modify
-  $ gh stack modify --continue`,
+  $ gh stack modify --continue
+
+  # Apply a restructure non-interactively from a JSON plan
+  $ gh stack modify --plan-file plan.json
+  $ echo "$PLAN" | gh stack modify --plan-file -`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if opts.abort {
 				return runModifyAbort(cfg)
@@ -52,19 +57,24 @@ afterward to push changes, update PRs, and recreate the stack on GitHub.`,
 			if opts.cont {
 				return runModifyContinue(cfg)
 			}
+			if opts.planFile != "" {
+				return runModifyPlan(cfg, opts.planFile)
+			}
 			return runModify(cfg)
 		},
 	}
 
 	cmd.Flags().BoolVar(&opts.abort, "abort", false, "Abort the modify session and restore the stack to its pre-modify state")
 	cmd.Flags().BoolVar(&opts.cont, "continue", false, "Continue after resolving conflicts")
+	cmd.Flags().StringVar(&opts.planFile, "plan-file", "", `Apply a restructure from a JSON plan instead of opening the TUI ("-" reads stdin)`)
+	cmd.MarkFlagsMutuallyExclusive("abort", "continue", "plan-file")
 
 	return cmd
 }
 
 func runModify(cfg *config.Config) error {
 	// Run all precondition checks
-	result, err := checkModifyPreconditions(cfg)
+	result, err := checkModifyPreconditions(cfg, true)
 	if err != nil {
 		return err
 	}
@@ -134,6 +144,10 @@ func runModify(cfg *config.Config) error {
 	reordered := make([]modifyview.ModifyBranchNode, len(applyNodes))
 	for i, n := range applyNodes {
 		reordered[len(applyNodes)-1-i] = n
+	}
+	if err := modify.ValidatePlan(sf, s, reordered); err != nil {
+		cfg.Errorf("invalid modify plan: %s", err)
+		return ErrInvalidArgs
 	}
 
 	applyResult, conflict, applyErr := modify.ApplyPlan(cfg, gitDir, s, sf, reordered, currentBranch, updateBaseSHAs)
@@ -272,8 +286,8 @@ func runModifyContinue(cfg *config.Config) error {
 // ---------------------------------------------------------------------------
 
 // checkModifyPreconditions runs all precondition checks for the modify command.
-func checkModifyPreconditions(cfg *config.Config) (*loadStackResult, error) {
-	if !cfg.IsInteractive() {
+func checkModifyPreconditions(cfg *config.Config, requireInteractive bool) (*loadStackResult, error) {
+	if requireInteractive && !cfg.IsInteractive() {
 		cfg.Errorf("modify requires an interactive terminal")
 		return nil, ErrSilent
 	}

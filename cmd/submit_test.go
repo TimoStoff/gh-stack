@@ -81,6 +81,32 @@ func TestGeneratePRBody(t *testing.T) {
 	}
 }
 
+func TestStripRepeatedTitle(t *testing.T) {
+	title := "[bugfix] Keep annotations consistent"
+	body := title + "\n\n" + title + "\n\nDescription:\nUseful details"
+	assert.Equal(t, "Description:\nUseful details", stripRepeatedTitle(title, body))
+	assert.Equal(t, "Different title\n\nDetails", stripRepeatedTitle(title, "Different title\n\nDetails"))
+}
+
+func TestFindSubmitStacks_ExplicitBranchPrefersOwningStackOverTrunk(t *testing.T) {
+	sf := &stack.StackFile{Stacks: []stack.Stack{
+		{
+			Trunk:    stack.BranchRef{Branch: "main"},
+			Branches: []stack.BranchRef{{Branch: "benchmark"}},
+		},
+		{
+			Trunk:    stack.BranchRef{Branch: "benchmark"},
+			Branches: []stack.BranchRef{{Branch: "dataset"}},
+		},
+	}}
+
+	implicit := findSubmitStacks(sf, "benchmark", false)
+	require.Len(t, implicit, 2)
+	explicit := findSubmitStacks(sf, "benchmark", true)
+	require.Len(t, explicit, 1)
+	assert.Equal(t, "main", explicit[0].Trunk.Branch)
+}
+
 // newSubmitMock creates a MockOps pre-configured for submit tests.
 func newSubmitMock(tmpDir string, currentBranch string) *git.MockOps {
 	return &git.MockOps{
@@ -2183,7 +2209,7 @@ func TestSubmit_FetchesBeforePush(t *testing.T) {
 	assert.Equal(t, "fetch", callOrder[0], "fetch must happen before any push")
 }
 
-func TestSubmit_UsesPRTemplate(t *testing.T) {
+func TestSubmit_CommitBodyTakesPrecedenceOverPRTemplate(t *testing.T) {
 	s := stack.Stack{
 		Trunk: stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{
@@ -2231,10 +2257,11 @@ func TestSubmit_UsesPRTemplate(t *testing.T) {
 	err := cmd.Execute()
 
 	assert.NoError(t, err)
-	assert.Contains(t, capturedBody, "## What")
-	assert.Contains(t, capturedBody, "## Why")
-	assert.NotContains(t, capturedBody, "GitHub Stacks CLI", "footer should not be present when template is used")
-	assert.NotContains(t, capturedBody, feedbackURL)
+	assert.Contains(t, capturedBody, "detailed commit body")
+	assert.NotContains(t, capturedBody, "## What")
+	assert.NotContains(t, capturedBody, "## Why")
+	assert.Contains(t, capturedBody, "GitHub Stacks CLI")
+	assert.Contains(t, capturedBody, feedbackURL)
 }
 
 // TestSubmit_IgnoresSymlinkedPRTemplate verifies that `gh stack submit --auto`
@@ -2588,4 +2615,58 @@ func TestEnsurePR_DeselectedNewBranchSkipsCreate(t *testing.T) {
 	err := ensurePR(cfg, client, s, 0, "main", &submitOptions{}, "", drafts)
 	require.NoError(t, err)
 	assert.Nil(t, s.Branches[0].PullRequest, "no PR should be recorded for a deselected branch")
+}
+
+func TestCreatePR_ReturnsGitHubError(t *testing.T) {
+	s := &stack.Stack{
+		Trunk:    stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{{Branch: "b1"}},
+	}
+	want := fmt.Errorf("base branch does not exist")
+	client := &github.MockClient{
+		CreatePRFn: func(string, string, string, string, bool) (*github.PullRequest, error) {
+			return nil, want
+		},
+	}
+	cfg, _, _ := config.NewTestConfig()
+
+	err := createPR(cfg, client, s, 0, "missing-base", &submitOptions{}, "", nil)
+
+	assert.ErrorIs(t, err, want)
+	assert.Nil(t, s.Branches[0].PullRequest)
+}
+
+func TestEnsurePR_UpdatesExistingTitleAndBody(t *testing.T) {
+	s := &stack.Stack{
+		Trunk:    stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{{Branch: "b1"}},
+	}
+	mock := &git.MockOps{
+		LogRangeFn: func(string, string) ([]git.CommitInfo, error) {
+			return []git.CommitInfo{{Subject: "New title", Body: "New description"}}, nil
+		},
+	}
+	restore := git.SetOps(mock)
+	defer restore()
+
+	var gotTitle, gotBody string
+	client := &github.MockClient{
+		FindPRForBranchFn: func(string) (*github.PullRequest, error) {
+			return &github.PullRequest{
+				Number: 10, ID: "PR_10", URL: "https://github.com/o/r/pull/10",
+				BaseRefName: "main", Title: "Old title", Body: "Old description",
+			}, nil
+		},
+		UpdatePRTitleBodyFn: func(_ int, title, body string) error {
+			gotTitle, gotBody = title, body
+			return nil
+		},
+	}
+	cfg, _, _ := config.NewTestConfig()
+
+	err := ensurePR(cfg, client, s, 0, "main", &submitOptions{}, "", nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, "New title", gotTitle)
+	assert.Contains(t, gotBody, "New description")
 }

@@ -208,6 +208,22 @@ func (c *Client) UpdatePRBase(number int, base string) error {
 	return c.rest.Patch(path, bytes.NewReader(body), nil)
 }
 
+// UpdatePRTitleBody updates a pull request's title and body.
+func (c *Client) UpdatePRTitleBody(number int, title, prBody string) error {
+	type updatePRRequest struct {
+		Title string `json:"title"`
+		Body  string `json:"body"`
+	}
+
+	body, err := json.Marshal(updatePRRequest{Title: title, Body: prBody})
+	if err != nil {
+		return fmt.Errorf("marshaling request: %w", err)
+	}
+
+	path := fmt.Sprintf("repos/%s/%s/pulls/%d", c.owner, c.repo, number)
+	return c.rest.Patch(path, bytes.NewReader(body), nil)
+}
+
 // MarkPRReadyForReview converts a draft pull request to ready for review.
 func (c *Client) MarkPRReadyForReview(prID string) error {
 	var mutation struct {

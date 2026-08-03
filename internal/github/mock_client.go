@@ -9,6 +9,7 @@ type MockClient struct {
 	FindPRDetailsForBranchFn   func(string) (*PRDetails, error)
 	CreatePRFn                 func(string, string, string, string, bool) (*PullRequest, error)
 	UpdatePRBaseFn             func(int, string) error
+	UpdatePRTitleBodyFn        func(int, string, string) error
 	MarkPRReadyForReviewFn     func(string) error
 	DisableAutoMergeFn         func(string) error
 	ListStacksFn               func() ([]RemoteStack, error)
@@ -58,6 +59,13 @@ func (m *MockClient) CreatePR(base, head, title, body string, draft bool) (*Pull
 func (m *MockClient) UpdatePRBase(number int, base string) error {
 	if m.UpdatePRBaseFn != nil {
 		return m.UpdatePRBaseFn(number, base)
+	}
+	return nil
+}
+
+func (m *MockClient) UpdatePRTitleBody(number int, title, body string) error {
+	if m.UpdatePRTitleBodyFn != nil {
+		return m.UpdatePRTitleBodyFn(number, title, body)
 	}
 	return nil
 }

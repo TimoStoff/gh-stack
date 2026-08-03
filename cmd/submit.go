@@ -24,6 +24,7 @@ type submitOptions struct {
 	auto   bool
 	open   bool
 	remote string
+	branch string
 }
 
 func SubmitCmd(cfg *config.Config) *cobra.Command {
@@ -69,6 +70,7 @@ In the editor, new PRs default to ready for review; switch any to draft with the
 	cmd.Flags().BoolVar(&opts.auto, "auto", false, "Use auto-generated PR titles without prompting")
 	cmd.Flags().BoolVar(&opts.open, "open", false, "Mark new and existing PRs as ready for review")
 	cmd.Flags().StringVar(&opts.remote, "remote", "", "Remote to push to (defaults to auto-detected remote)")
+	cmd.Flags().StringVar(&opts.branch, "branch", "", "Submit the stack that owns this branch")
 
 	return cmd
 }
@@ -94,15 +96,21 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 
 	cfg.Printf("Checking stack state...")
 
-	// Find the stack for the current branch without switching branches.
+	// Find the stack for the requested branch without switching branches. When
+	// a branch is both one stack's PR and another stack's trunk, --branch means
+	// the former; that is the stack a submit button on the commit must target.
+	targetBranch := currentBranch
+	if opts.branch != "" {
+		targetBranch = opts.branch
+	}
 	// Submit should never change the user's checked-out branch.
-	stacks := sf.FindAllStacksForBranch(currentBranch)
+	stacks := findSubmitStacks(sf, targetBranch, opts.branch != "")
 	if len(stacks) == 0 {
-		cfg.Errorf("current branch %q is not part of a stack", currentBranch)
+		cfg.Errorf("branch %q is not owned by a stack", targetBranch)
 		return ErrNotInStack
 	}
 	if len(stacks) > 1 {
-		cfg.Errorf("branch %q belongs to multiple stacks; checkout a non-trunk branch first", currentBranch)
+		cfg.Errorf("branch %q is owned by multiple stacks", targetBranch)
 		return ErrDisambiguate
 	}
 	s := stacks[0]
@@ -150,7 +158,7 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	}
 
 	// Resolve remote for pushing
-	remote, err := pickRemote(cfg, currentBranch, opts.remote)
+	remote, err := pickRemote(cfg, targetBranch, opts.remote)
 	if err != nil {
 		if !errors.Is(err, errInterrupt) {
 			cfg.Errorf("%s", err)
@@ -218,6 +226,7 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	// Sequential pushing ensures each branch's base is up-to-date on the
 	// remote before the next branch is pushed, preventing race conditions.
 	cfg.Printf("Pushing to %s...", remote)
+	prFailures := 0
 	for i, b := range s.Branches {
 		if s.Branches[i].IsMerged() || s.Branches[i].IsQueued() {
 			continue
@@ -236,8 +245,17 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 				printInterrupt(cfg)
 				return ErrSilent
 			}
-			// Non-fatal — continue with remaining branches
+			prFailures++
 		}
+	}
+	if prFailures > 0 {
+		// Preserve any successfully discovered/created PR references, but do not
+		// create a remote stack from an incomplete set of PRs.
+		if err := stack.Save(gitDir, sf); err != nil {
+			return handleSaveError(cfg, err)
+		}
+		cfg.Errorf("failed to create or synchronize %d pull request(s)", prFailures)
+		return ErrAPIFailure
 	}
 
 	// Create or update the stack on GitHub
@@ -253,9 +271,22 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	if err := stack.Save(gitDir, sf); err != nil {
 		return handleSaveError(cfg, err)
 	}
-
 	cfg.Successf("Pushed and synced %d branches", len(s.ActiveBranches()))
 	return nil
+}
+
+func findSubmitStacks(sf *stack.StackFile, branch string, requireOwnership bool) []*stack.Stack {
+	stacks := sf.FindAllStacksForBranch(branch)
+	if !requireOwnership {
+		return stacks
+	}
+	owned := stacks[:0]
+	for _, candidate := range stacks {
+		if candidate.IndexOf(branch) >= 0 {
+			owned = append(owned, candidate)
+		}
+	}
+	return owned
 }
 
 // collectPRDrafts loads branch display data and runs the interactive submit TUI
@@ -332,7 +363,7 @@ func ensurePR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 	pr, err := client.FindPRForBranch(b.Branch)
 	if err != nil {
 		cfg.Warningf("failed to check PR for %s: %v", b.Branch, err)
-		return nil
+		return err
 	}
 
 	if pr == nil {
@@ -383,6 +414,19 @@ func ensurePR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 		cfg.Printf("PR %s for %s is up to date", cfg.PRLink(pr.Number, pr.URL), b.Branch)
 	}
 
+	// The commit message is the local source of truth on submit. Keep the
+	// ordinary GitHub PR title/body in sync with what the ISL editor shows.
+	title, commitBody := defaultPRTitleBody(baseBranch, b.Branch)
+	body := generatePRBody(commitBody, "")
+	if pr.Title != title || strings.TrimSpace(pr.Body) != strings.TrimSpace(body) {
+		if err := client.UpdatePRTitleBody(pr.Number, title, body); err != nil {
+			cfg.Warningf("failed to update title and description for PR %s: %v",
+				cfg.PRLink(pr.Number, pr.URL), err)
+			return err
+		}
+		cfg.Successf("Updated title and description for PR %s", cfg.PRLink(pr.Number, pr.URL))
+	}
+
 	// Convert draft PR to ready for review when --open is set.
 	if opts.open && pr.IsDraft {
 		if err := client.MarkPRReadyForReview(pr.ID); err != nil {
@@ -425,13 +469,20 @@ func createPR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 		// drafted in the submit TUI instead).
 		var commitBody string
 		title, commitBody = defaultPRTitleBody(baseBranch, b.Branch)
-		body = generatePRBody(commitBody, templateContent)
+		// A commit body edited in ISL is review content, so it takes precedence
+		// over a repository template. Use the template only when no description
+		// was supplied.
+		if commitBody == "" {
+			body = generatePRBody("", templateContent)
+		} else {
+			body = generatePRBody(commitBody, "")
+		}
 	}
 
 	newPR, createErr := client.CreatePR(baseBranch, b.Branch, title, body, isDraft)
 	if createErr != nil {
 		cfg.Warningf("failed to create PR for %s: %v", b.Branch, createErr)
-		return nil
+		return createErr
 	}
 	cfg.Successf("Created PR %s for %s", cfg.PRLink(newPR.Number, newPR.URL), b.Branch)
 	s.Branches[i].PullRequest = &stack.PullRequestRef{
@@ -448,9 +499,21 @@ func createPR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 func defaultPRTitleBody(base, head string) (string, string) {
 	commits, err := git.LogRange(base, head)
 	if err == nil && len(commits) == 1 {
-		return commits[0].Subject, strings.TrimSpace(commits[0].Body)
+		return commits[0].Subject, stripRepeatedTitle(commits[0].Subject, commits[0].Body)
 	}
 	return humanize(head), ""
+}
+
+// stripRepeatedTitle repairs messages produced by older ISL amend behavior,
+// which could prepend the subject to the body each time the title was edited.
+// Only exact leading subject paragraphs are removed; all authored body text is
+// otherwise preserved.
+func stripRepeatedTitle(subject, body string) string {
+	body = strings.TrimSpace(body)
+	for body == subject || strings.HasPrefix(body, subject+"\n") {
+		body = strings.TrimSpace(strings.TrimPrefix(body, subject))
+	}
+	return body
 }
 
 // generatePRBody builds a PR description. When a templateContent is provided,

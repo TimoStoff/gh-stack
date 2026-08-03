@@ -3,6 +3,7 @@ package modify
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -478,6 +479,45 @@ func TestApplyPlan_Rename(t *testing.T) {
 	require.Len(t, result.RenamedBranches, 1)
 	assert.Equal(t, "A", result.RenamedBranches[0].OldName)
 	assert.Equal(t, "new-A", result.RenamedBranches[0].NewName)
+}
+
+func TestApplyPlan_RenameFailureUnwindsWithoutRelocking(t *testing.T) {
+	s := stack.Stack{
+		Trunk:    stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{{Branch: "A"}},
+	}
+
+	gitDir := t.TempDir()
+	sf := writeTestStackFile(t, gitDir, s)
+	mock := newApplyMock(gitDir, map[string]string{"main": "sha-main", "A": "sha-A"})
+	mock.RenameBranchFn = func(string, string) error { return errors.New("invalid branch name") }
+	restore := git.SetOps(mock)
+	defer restore()
+
+	cfg, outR, errR := config.NewTestConfig()
+	nodes := makeNodes(&sf.Stacks[0])
+	nodes[0].PendingAction = &modifyview.PendingAction{
+		Type:    modifyview.ActionRename,
+		NewName: "invalid",
+	}
+
+	_, _, err := ApplyPlan(cfg, gitDir, &sf.Stacks[0], sf, nodes, "A", noopUpdateBaseSHAs)
+	require.ErrorContains(t, err, "invalid branch name")
+	require.NoError(t, cfg.Out.Close())
+	require.NoError(t, cfg.Err.Close())
+	stdout, readOutErr := io.ReadAll(outR)
+	require.NoError(t, readOutErr)
+	stderr, readErrErr := io.ReadAll(errR)
+	require.NoError(t, readErrErr)
+	output := string(stdout) + string(stderr)
+	assert.NotContains(t, output, "timed out waiting for stack lock")
+	assert.NotContains(t, output, "failed to save restored stack")
+
+	restored, loadErr := stack.Load(gitDir)
+	require.NoError(t, loadErr)
+	require.Len(t, restored.Stacks, 1)
+	require.Len(t, restored.Stacks[0].Branches, 1)
+	assert.Equal(t, "A", restored.Stacks[0].Branches[0].Branch)
 }
 
 // ─── ApplyPlan: Reorder ──────────────────────────────────────────────────────

@@ -163,7 +163,7 @@ func ApplyPlan(
 	originalRefs, err := git.RevParseMap(branchNames)
 	if err != nil {
 		// Unwind on failure
-		unwindErr := Unwind(cfg, gitDir, snapshot, stackIndex, sf, plan)
+		unwindErr := unwindWithLock(cfg, gitDir, snapshot, stackIndex, sf, plan, lock)
 		if unwindErr != nil {
 			return nil, nil, fmt.Errorf("failed to resolve refs (%v) and unwind failed (%v)", err, unwindErr)
 		}
@@ -193,7 +193,7 @@ func ApplyPlan(
 			oldName := n.Ref.Branch
 			newName := n.PendingAction.NewName
 			if err := git.RenameBranch(oldName, newName); err != nil {
-				unwindErr := Unwind(cfg, gitDir, snapshot, stackIndex, sf, plan)
+				unwindErr := unwindWithLock(cfg, gitDir, snapshot, stackIndex, sf, plan, lock)
 				if unwindErr != nil {
 					return nil, nil, fmt.Errorf("rename failed (%v) and unwind failed (%v)", err, unwindErr)
 				}
@@ -284,7 +284,7 @@ func ApplyPlan(
 
 		// Create the git branch at the parent's tip
 		if err := git.CreateBranch(newName, parentBranch); err != nil {
-			unwindErr := Unwind(cfg, gitDir, snapshot, stackIndex, sf, plan)
+			unwindErr := unwindWithLock(cfg, gitDir, snapshot, stackIndex, sf, plan, lock)
 			if unwindErr != nil {
 				return nil, nil, fmt.Errorf("creating branch %s failed (%v) and unwind failed (%v)", newName, err, unwindErr)
 			}
@@ -385,7 +385,7 @@ func ApplyPlan(
 				cfg.Printf("No commits to fold from %s", foldBranch)
 			} else {
 				if err := git.CheckoutBranch(targetBranch); err != nil {
-					unwindErr := Unwind(cfg, gitDir, snapshot, stackIndex, sf, plan)
+					unwindErr := unwindWithLock(cfg, gitDir, snapshot, stackIndex, sf, plan, lock)
 					if unwindErr != nil {
 						return nil, nil, fmt.Errorf("checkout failed (%v) and unwind failed (%v)", err, unwindErr)
 					}
@@ -1018,6 +1018,11 @@ func ContinueApply(
 // Unwind restores the stack to its pre-modify state using the snapshot.
 // stackIndex is the index of the stack in sf.Stacks at modify start time.
 func Unwind(cfg *config.Config, gitDir string, snapshot Snapshot, stackIndex int, sf *stack.StackFile, plan []Action) error {
+	return unwindWithLock(cfg, gitDir, snapshot, stackIndex, sf, plan, nil)
+}
+
+// unwindWithLock can reuse the lock held by ApplyPlan.
+func unwindWithLock(cfg *config.Config, gitDir string, snapshot Snapshot, stackIndex int, sf *stack.StackFile, plan []Action, lock *stack.FileLock) error {
 	// Abort any in-progress rebase or cherry-pick so the working tree and
 	// index are clean before we restore branch tips. A fold-down conflict
 	// leaves an in-progress cherry-pick with an unmerged index; without
@@ -1072,8 +1077,14 @@ func Unwind(cfg *config.Config, gitDir string, snapshot Snapshot, stackIndex int
 	}
 
 	// Save restored stack
-	if err := stack.Save(gitDir, sf); err != nil {
-		cfg.Warningf("failed to save restored stack: %v", err)
+	var saveErr error
+	if lock != nil {
+		saveErr = stack.SaveWithLock(gitDir, sf, lock)
+	} else {
+		saveErr = stack.Save(gitDir, sf)
+	}
+	if saveErr != nil {
+		cfg.Warningf("failed to save restored stack: %v", saveErr)
 	}
 
 	// Clear state file

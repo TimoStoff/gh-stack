@@ -573,9 +573,12 @@ func (d *defaultOps) DeleteBranch(name string, force bool) error {
 }
 
 func (d *defaultOps) DeleteRemoteBranch(remote, branch string) error {
-	// Fully-qualify the ref so a branch name is never reinterpreted as
-	// refspec syntax.
-	return runSilent("push", remote, "--delete", "refs/heads/"+branch)
+	ref := "refs/heads/" + branch
+	out, err := run("ls-remote", "--heads", remote, ref)
+	if err != nil || out == "" {
+		return err
+	}
+	return runSilent("push", remote, "--delete", ref)
 }
 
 func (d *defaultOps) DeleteTrackingRef(remote, branch string) error {

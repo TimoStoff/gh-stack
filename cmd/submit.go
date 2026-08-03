@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -21,13 +22,19 @@ import (
 )
 
 type submitOptions struct {
-	auto       bool
-	open       bool
-	draft      bool
-	remote     string
-	branch     string
-	only       bool
-	dependents bool
+	auto          bool
+	open          bool
+	draft         bool
+	remote        string
+	branch        string
+	only          bool
+	dependents    bool
+	renameSources map[string]*renameSource
+}
+
+type renameSource struct {
+	OldBranch string
+	Body      string
 }
 
 func SubmitCmd(cfg *config.Config) *cobra.Command {
@@ -56,7 +63,7 @@ This command performs several steps:
 
 In the editor, new PRs default to ready for review; switch any to draft with the
 "CREATE AS" toggle. With --auto, new PRs are created as drafts unless you pass
---open. Pass --draft to also convert existing open PRs back to draft.`,
+--open. Pass --draft to convert existing open PRs back to draft.`,
 		Example: `  # Push and create/update PRs (opens the interactive editor)
   $ gh stack submit
 
@@ -66,7 +73,7 @@ In the editor, new PRs default to ready for review; switch any to draft with the
   # Mark new and existing PRs as ready for review
   $ gh stack submit --open
 
-  # Mark new and existing PRs as drafts
+  # Convert existing PRs to drafts
   $ gh stack submit --draft
 
   # Submit only one branch, or it and every branch that depends on it
@@ -79,7 +86,7 @@ In the editor, new PRs default to ready for review; switch any to draft with the
 
 	cmd.Flags().BoolVar(&opts.auto, "auto", false, "Use auto-generated PR titles without prompting")
 	cmd.Flags().BoolVar(&opts.open, "open", false, "Mark new and existing PRs as ready for review")
-	cmd.Flags().BoolVar(&opts.draft, "draft", false, "Mark new and existing PRs as drafts")
+	cmd.Flags().BoolVar(&opts.draft, "draft", false, "Convert existing PRs to drafts")
 	cmd.MarkFlagsMutuallyExclusive("open", "draft")
 	cmd.Flags().StringVar(&opts.remote, "remote", "", "Remote to push to (defaults to auto-detected remote)")
 	cmd.Flags().StringVar(&opts.branch, "branch", "", "Submit the stack that owns this branch")
@@ -96,6 +103,10 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 		cfg.Errorf("not a git repository")
 		return ErrNotInStack
 	}
+	if err := modify.CheckStateGuard(gitDir); err != nil {
+		cfg.Errorf("%s", err)
+		return ErrModifyRecovery
+	}
 
 	sf, err := stack.Load(gitDir)
 	if err != nil {
@@ -111,14 +122,10 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 
 	cfg.Printf("Checking stack state...")
 
-	// Find the stack for the requested branch without switching branches. When
-	// a branch is both one stack's PR and another stack's trunk, --branch means
-	// the former; that is the stack a submit button on the commit must target.
 	targetBranch := currentBranch
 	if opts.branch != "" {
 		targetBranch = opts.branch
 	}
-	// Submit should never change the user's checked-out branch.
 	stacks := findSubmitStacks(sf, targetBranch, opts.branch != "")
 	if len(stacks) == 0 {
 		cfg.Errorf("branch %q is not owned by a stack", targetBranch)
@@ -129,11 +136,15 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 		return ErrDisambiguate
 	}
 	s := stacks[0]
-	submitIndices := submitBranchIndices(s, targetBranch, opts)
 
 	client, err := cfg.GitHubClient()
 	if err != nil {
 		cfg.Errorf("failed to create GitHub client: %s", err)
+		return ErrAPIFailure
+	}
+	opts.renameSources, err = pendingRenameSources(gitDir, client)
+	if err != nil {
+		cfg.Errorf("failed to load pending rename state: %s", err)
 		return ErrAPIFailure
 	}
 
@@ -172,6 +183,11 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	if stacksAvailable {
 		s = maybeForkFromMergedBase(cfg, client, sf, s, gitDir)
 	}
+	start, end, err := submitBranchRange(s, targetBranch, opts)
+	if err != nil {
+		cfg.Errorf("%s", err)
+		return ErrInvalidArgs
+	}
 
 	// Resolve remote for pushing
 	remote, err := pickRemote(cfg, targetBranch, opts.remote)
@@ -189,7 +205,7 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	if len(queued) > 0 {
 		cfg.Printf("Skipping %d queued %s", len(queued), plural(len(queued), "branch", "branches"))
 	}
-	activeBranches := activeBranchNamesAtIndices(s, submitIndices)
+	activeBranches := activeBranchNamesInRange(s, start, end)
 	if len(activeBranches) == 0 {
 		cfg.Printf("All branches are merged or queued, nothing to submit")
 		return nil
@@ -243,8 +259,9 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	// remote before the next branch is pushed, preventing race conditions.
 	cfg.Printf("Pushing to %s...", remote)
 	prFailures := 0
+	pendingCleanups := len(opts.renameSources)
 	for i, b := range s.Branches {
-		if _, selected := submitIndices[i]; !selected {
+		if i < start || i >= end {
 			continue
 		}
 		if s.Branches[i].IsMerged() || s.Branches[i].IsQueued() {
@@ -265,6 +282,17 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 				return ErrSilent
 			}
 			prFailures++
+			continue
+		}
+
+		if source := opts.renameSources[b.Branch]; source != nil && source.OldBranch != b.Branch {
+			if err := git.DeleteRemoteBranch(remote, source.OldBranch); err != nil {
+				cfg.Warningf("failed to delete old remote branch %s: %v",
+					source.OldBranch, err)
+			} else {
+				cfg.Successf("Removed renamed remote branch %s", source.OldBranch)
+				pendingCleanups--
+			}
 		}
 	}
 	if prFailures > 0 {
@@ -277,10 +305,9 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 		return ErrAPIFailure
 	}
 
-	// Create or update the stack on GitHub
+	stackSynced := true
 	if stacksAvailable {
-		syncStack(cfg, client, s)
-		clearPendingModifyState(cfg, gitDir)
+		stackSynced = syncStack(cfg, client, s)
 	}
 
 	// Update base commit hashes and sync PR state
@@ -290,32 +317,68 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	if err := stack.Save(gitDir, sf); err != nil {
 		return handleSaveError(cfg, err)
 	}
+	if err := completePendingModify(cfg, gitDir, stackSynced, pendingCleanups == 0); err != nil {
+		return err
+	}
 	cfg.Successf("Pushed and synced %d branches", len(activeBranches))
 	return nil
 }
 
-// submitBranchIndices resolves the requested submit scope. With no scope flag,
-// gh-stack retains its historical whole-stack behavior. --only selects exactly
-// the requested branch, while --dependents also selects every branch above it.
-func submitBranchIndices(s *stack.Stack, targetBranch string, opts *submitOptions) map[int]struct{} {
-	selected := make(map[int]struct{})
+// pendingRenameSources restores PR details saved before a rename.
+func pendingRenameSources(gitDir string, client github.ClientOps) (map[string]*renameSource, error) {
+	sources := make(map[string]*renameSource)
+	state, err := modify.LoadState(gitDir)
+	if err != nil {
+		return nil, err
+	}
+	if state == nil || state.Phase != modify.PhasePendingSubmit {
+		return sources, nil
+	}
+
+	var before stack.Stack
+	if err := json.Unmarshal(state.Snapshot.StackMetadata, &before); err != nil {
+		return nil, fmt.Errorf("decode stack snapshot: %w", err)
+	}
+	for _, action := range state.Plan {
+		if action.Type != "rename" || action.NewName == "" {
+			continue
+		}
+		source := &renameSource{OldBranch: action.Branch}
+		if idx := before.IndexOf(action.Branch); idx >= 0 {
+			if ref := before.Branches[idx].PullRequest; ref != nil && ref.Number > 0 {
+				pr, err := client.FindPRByNumber(ref.Number)
+				if err != nil {
+					return nil, fmt.Errorf("load PR #%d: %w", ref.Number, err)
+				}
+				if pr == nil {
+					return nil, fmt.Errorf("PR #%d was not found", ref.Number)
+				}
+				source.Body = pr.Body
+			}
+		}
+		sources[action.NewName] = source
+	}
+	return sources, nil
+}
+
+func submitBranchRange(s *stack.Stack, targetBranch string, opts *submitOptions) (int, int, error) {
 	start, end := 0, len(s.Branches)
 	if opts.only || opts.dependents {
 		start = s.IndexOf(targetBranch)
+		if start < 0 {
+			return 0, 0, fmt.Errorf("branch %q is not a stack branch", targetBranch)
+		}
 		if opts.only {
 			end = start + 1
 		}
 	}
-	for i := start; i >= 0 && i < end; i++ {
-		selected[i] = struct{}{}
-	}
-	return selected
+	return start, end, nil
 }
 
-func activeBranchNamesAtIndices(s *stack.Stack, indices map[int]struct{}) []string {
-	branches := make([]string, 0, len(indices))
-	for i, b := range s.Branches {
-		if _, selected := indices[i]; selected && !b.IsSkipped() {
+func activeBranchNamesInRange(s *stack.Stack, start, end int) []string {
+	branches := make([]string, 0, end-start)
+	for i := start; i < end; i++ {
+		if b := s.Branches[i]; !b.IsSkipped() {
 			branches = append(branches, b.Branch)
 		}
 	}
@@ -461,11 +524,8 @@ func ensurePR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 		cfg.Printf("PR %s for %s is up to date", cfg.PRLink(pr.Number, pr.URL), b.Branch)
 	}
 
-	// The commit message is the local source of truth on submit. Keep the
-	// ordinary GitHub PR title/body in sync with what the ISL editor shows.
-	title, commitBody := defaultPRTitleBody(baseBranch, b.Branch)
-	body := generatePRBody(commitBody, "")
-	if pr.Title != title || strings.TrimSpace(pr.Body) != strings.TrimSpace(body) {
+	if title, body, ok := existingPRTitleBody(baseBranch, b.Branch, pr, opts); ok &&
+		(pr.Title != title || strings.TrimSpace(pr.Body) != strings.TrimSpace(body)) {
 		if err := client.UpdatePRTitleBody(pr.Number, title, body); err != nil {
 			cfg.Warningf("failed to update title and description for PR %s: %v",
 				cfg.PRLink(pr.Number, pr.URL), err)
@@ -474,7 +534,6 @@ func ensurePR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 		cfg.Successf("Updated title and description for PR %s", cfg.PRLink(pr.Number, pr.URL))
 	}
 
-	// Explicit state flags apply to existing PRs as well as newly created ones.
 	if opts.draft && !pr.IsDraft {
 		if err := client.MarkPRDraft(pr.ID); err != nil {
 			cfg.Warningf("failed to mark PR %s as draft: %v",
@@ -521,16 +580,7 @@ func createPR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 		// Auto / non-interactive default path: an auto-generated title and a
 		// body built from the branch's commits (the interactive title is
 		// drafted in the submit TUI instead).
-		var commitBody string
-		title, commitBody = defaultPRTitleBody(baseBranch, b.Branch)
-		// A commit body edited in ISL is review content, so it takes precedence
-		// over a repository template. Use the template only when no description
-		// was supplied.
-		if commitBody == "" {
-			body = generatePRBody("", templateContent)
-		} else {
-			body = generatePRBody(commitBody, "")
-		}
+		title, body = desiredPRTitleBody(baseBranch, b.Branch, opts, templateContent)
 	}
 
 	newPR, createErr := client.CreatePR(baseBranch, b.Branch, title, body, isDraft)
@@ -547,27 +597,58 @@ func createPR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 	return nil
 }
 
+func desiredPRTitleBody(base, branch string, opts *submitOptions, templateContent string) (string, string) {
+	title, commitBody := defaultPRTitleBody(base, branch)
+	if source := opts.renameSources[branch]; source != nil {
+		title = humanize(branch)
+		if commitBody == "" {
+			commitBody = stripStackAttribution(source.Body)
+		}
+		return title, generatePRBody(commitBody, "")
+	}
+	return title, generatePRBody(commitBody, templateContent)
+}
+
+func existingPRTitleBody(base, branch string, pr *github.PullRequest, opts *submitOptions) (string, string, bool) {
+	if opts.renameSources[branch] != nil {
+		title, body := desiredPRTitleBody(base, branch, opts, "")
+		return title, body, true
+	}
+	if !opts.only && !opts.dependents {
+		return "", "", false
+	}
+	commits, err := git.LogRange(base, branch)
+	if err != nil || len(commits) != 1 {
+		return "", "", false
+	}
+	body := strings.TrimSpace(commits[0].Body)
+	if body == "" {
+		body = pr.Body
+	} else {
+		body = generatePRBody(body, "")
+	}
+	return commits[0].Subject, body, true
+}
+
+func stripStackAttribution(body string) string {
+	const marker = `<sub>Stack created with <a href="https://github.com/github/gh-stack">`
+	if index := strings.Index(body, marker); index >= 0 {
+		body = body[:index]
+	}
+	body = strings.TrimSpace(body)
+	body = strings.TrimSpace(strings.TrimSuffix(body, "---"))
+	return body
+}
+
 // defaultPRTitleBody generates a PR title and body from the branch's commits.
 // If there is exactly one commit, use its subject as the title and its body
 // (if any) as the PR body. Otherwise, humanize the branch name for the title.
 func defaultPRTitleBody(base, head string) (string, string) {
 	commits, err := git.LogRange(base, head)
 	if err == nil && len(commits) == 1 {
-		return commits[0].Subject, stripRepeatedTitle(commits[0].Subject, commits[0].Body)
+		return commits[0].Subject, strings.TrimSpace(commits[0].Body)
 	}
 	return humanize(head), ""
-}
-
-// stripRepeatedTitle repairs messages produced by older ISL amend behavior,
-// which could prepend the subject to the body each time the title was edited.
-// Only exact leading subject paragraphs are removed; all authored body text is
-// otherwise preserved.
-func stripRepeatedTitle(subject, body string) string {
-	body = strings.TrimSpace(body)
-	for body == subject || strings.HasPrefix(body, subject+"\n") {
-		body = strings.TrimSpace(strings.TrimPrefix(body, subject))
-	}
-	return body
 }
 
 // generatePRBody builds a PR description. When a templateContent is provided,
@@ -798,14 +879,17 @@ func handlePendingModify(cfg *config.Config, client github.ClientOps, s *stack.S
 	return nil
 }
 
-// clearPendingModifyState clears the modify state file after a successful submit.
-// Called after syncStack succeeds to ensure retry safety.
-func clearPendingModifyState(cfg *config.Config, gitDir string) {
+func completePendingModify(cfg *config.Config, gitDir string, stackSynced, cleanupDone bool) error {
 	if !modify.StateExists(gitDir) {
-		return
+		return nil
+	}
+	if !stackSynced || !cleanupDone {
+		cfg.Errorf("stack cleanup is incomplete; run `gh stack submit` again")
+		return ErrAPIFailure
 	}
 	modify.ClearState(gitDir)
 	cfg.Successf("Stack recreated on GitHub to match local state")
+	return nil
 }
 
 // syncStack creates or updates a stack on GitHub from the active PRs.

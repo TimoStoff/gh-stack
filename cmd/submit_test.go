@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/cli/go-gh/v2/pkg/api"
@@ -79,13 +80,6 @@ func TestGeneratePRBody(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestStripRepeatedTitle(t *testing.T) {
-	title := "[bugfix] Keep annotations consistent"
-	body := title + "\n\n" + title + "\n\nDescription:\nUseful details"
-	assert.Equal(t, "Description:\nUseful details", stripRepeatedTitle(title, body))
-	assert.Equal(t, "Different title\n\nDetails", stripRepeatedTitle(title, "Different title\n\nDetails"))
 }
 
 func TestFindSubmitStacks_ExplicitBranchPrefersOwningStackOverTrunk(t *testing.T) {
@@ -2040,31 +2034,30 @@ func TestHandlePendingModify_Delete404(t *testing.T) {
 	assert.Equal(t, "", s.ID, "stack ID should be cleared after 404")
 }
 
-func TestClearPendingModifyState_ClearsFile(t *testing.T) {
-	gitDir := t.TempDir()
+func TestCompletePendingModify_ClearsStateOnlyAfterSuccess(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		stackSynced bool
+		cleanupDone bool
+		wantError   bool
+	}{
+		{name: "complete", stackSynced: true, cleanupDone: true},
+		{name: "stack sync failed", cleanupDone: true, wantError: true},
+		{name: "remote cleanup failed", stackSynced: true, wantError: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			gitDir := t.TempDir()
+			saveModifyState(t, gitDir, newPendingSubmitState("stack-789"))
+			cfg, _, _ := config.NewTestConfig()
+			defer cfg.Out.Close()
+			defer cfg.Err.Close()
 
-	saveModifyState(t, gitDir, newPendingSubmitState("stack-789"))
-	require.True(t, modify.StateExists(gitDir), "precondition: state file should exist")
+			err := completePendingModify(cfg, gitDir, test.stackSynced, test.cleanupDone)
 
-	cfg, _, _ := config.NewTestConfig()
-	defer cfg.Out.Close()
-	defer cfg.Err.Close()
-
-	clearPendingModifyState(cfg, gitDir)
-	assert.False(t, modify.StateExists(gitDir), "state file should be removed")
-}
-
-func TestClearPendingModifyState_NoFile(t *testing.T) {
-	gitDir := t.TempDir()
-	// No state file on disk.
-
-	cfg, _, _ := config.NewTestConfig()
-	defer cfg.Out.Close()
-	defer cfg.Err.Close()
-
-	// Should not panic or error.
-	clearPendingModifyState(cfg, gitDir)
-	assert.False(t, modify.StateExists(gitDir))
+			assert.Equal(t, test.wantError, err != nil)
+			assert.Equal(t, test.wantError, modify.StateExists(gitDir))
+		})
+	}
 }
 
 func TestSubmit_WithPendingModify_SequentialPush(t *testing.T) {
@@ -2198,6 +2191,100 @@ func TestSubmit_WithPendingModify_SequentialPush(t *testing.T) {
 	assert.False(t, modify.StateExists(tmpDir), "modify state file should be cleared after success")
 }
 
+func TestSubmit_RenameReplacesPRMetadataAndDeletesOldRemoteBranch(t *testing.T) {
+	oldPR := &github.PullRequest{
+		Number: 10, ID: "PR_10", State: "OPEN", HeadRefName: "old-name",
+		BaseRefName: "main", Title: "old name",
+		Body: "Authored details\n\n---\n\n" + generatePRBody("", ""),
+	}
+	s := stack.Stack{
+		ID:     "42",
+		Number: 7,
+		Trunk:  stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{
+				Branch:      "new-name",
+				PullRequest: &stack.PullRequestRef{Number: 10, ID: "PR_10"},
+			},
+			{
+				Branch:      "next",
+				PullRequest: &stack.PullRequestRef{Number: 11, ID: "PR_11"},
+			},
+		},
+	}
+	tmpDir := t.TempDir()
+	writeStackFile(t, tmpDir, s)
+	before := s
+	before.Branches[0].Branch = "old-name"
+	metadata, err := json.Marshal(before)
+	require.NoError(t, err)
+	saveModifyState(t, tmpDir, &modify.StateFile{
+		SchemaVersion:      1,
+		Phase:              modify.PhasePendingSubmit,
+		PriorRemoteStackID: "42",
+		Snapshot:           modify.Snapshot{StackMetadata: metadata},
+		Plan: []modify.Action{{
+			Type: "rename", Branch: "old-name", NewName: "new-name",
+		}},
+	})
+
+	mock := newSubmitMock(tmpDir, "new-name")
+	var deletedBranch string
+	mock.DeleteRemoteBranchFn = func(_ string, branch string) error {
+		deletedBranch = branch
+		return nil
+	}
+	restore := git.SetOps(mock)
+	defer restore()
+
+	unstacked := false
+	var createdTitle, createdBody string
+	newPR := &github.PullRequest{
+		Number: 20, ID: "PR_20", State: "OPEN", HeadRefName: "new-name",
+		BaseRefName: "main", URL: "https://github.com/owner/repo/pull/20",
+	}
+	cfg, _, _ := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) {
+			if unstacked {
+				return nil, nil
+			}
+			return []github.RemoteStack{{ID: 42, Number: 7, PullRequests: []int{10}}}, nil
+		},
+		FindPRByNumberFn: func(number int) (*github.PullRequest, error) {
+			if number == 20 {
+				return newPR, nil
+			}
+			if number == 10 {
+				return oldPR, nil
+			}
+			return &github.PullRequest{
+				Number: 11, ID: "PR_11", State: "OPEN", HeadRefName: "next",
+				BaseRefName: "new-name",
+			}, nil
+		},
+		FindPRForBranchFn: func(string) (*github.PullRequest, error) { return nil, nil },
+		UnstackFn: func(int) (*github.RemoteStack, bool, error) {
+			unstacked = true
+			return nil, true, nil
+		},
+		CreatePRFn: func(_, _ string, title, body string, _ bool) (*github.PullRequest, error) {
+			createdTitle, createdBody = title, body
+			return newPR, nil
+		},
+	}
+
+	cmd := SubmitCmd(cfg)
+	cmd.SetArgs([]string{"--auto", "--only"})
+	err = cmd.Execute()
+
+	require.NoError(t, err)
+	assert.Equal(t, "new name", createdTitle)
+	assert.Contains(t, createdBody, "Authored details")
+	assert.Equal(t, 1, strings.Count(createdBody, "GitHub Stacks CLI"))
+	assert.Equal(t, "old-name", deletedBranch)
+}
+
 func TestSubmit_FetchesBeforePush(t *testing.T) {
 	s := stack.Stack{
 		Trunk: stack.BranchRef{Branch: "main"},
@@ -2263,7 +2350,7 @@ func TestSubmit_FetchesBeforePush(t *testing.T) {
 	assert.Equal(t, "fetch", callOrder[0], "fetch must happen before any push")
 }
 
-func TestSubmit_CommitBodyTakesPrecedenceOverPRTemplate(t *testing.T) {
+func TestSubmit_UsesPRTemplate(t *testing.T) {
 	s := stack.Stack{
 		Trunk: stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{
@@ -2311,11 +2398,10 @@ func TestSubmit_CommitBodyTakesPrecedenceOverPRTemplate(t *testing.T) {
 	err := cmd.Execute()
 
 	assert.NoError(t, err)
-	assert.Contains(t, capturedBody, "detailed commit body")
-	assert.NotContains(t, capturedBody, "## What")
-	assert.NotContains(t, capturedBody, "## Why")
-	assert.Contains(t, capturedBody, "GitHub Stacks CLI")
-	assert.Contains(t, capturedBody, feedbackURL)
+	assert.Contains(t, capturedBody, "## What")
+	assert.Contains(t, capturedBody, "## Why")
+	assert.NotContains(t, capturedBody, "GitHub Stacks CLI", "footer should not be present when template is used")
+	assert.NotContains(t, capturedBody, feedbackURL)
 }
 
 // TestSubmit_IgnoresSymlinkedPRTemplate verifies that `gh stack submit --auto`
@@ -2718,14 +2804,32 @@ func TestEnsurePR_UpdatesExistingTitleAndBody(t *testing.T) {
 	}
 	cfg, _, _ := config.NewTestConfig()
 
-	err := ensurePR(cfg, client, s, 0, "main", &submitOptions{}, "", nil)
+	err := ensurePR(cfg, client, s, 0, "main", &submitOptions{only: true}, "", nil)
 
 	require.NoError(t, err)
 	assert.Equal(t, "New title", gotTitle)
 	assert.Contains(t, gotBody, "New description")
 }
 
-func TestSubmitBranchIndices(t *testing.T) {
+func TestExistingPRTitleBody_PreservesRemoteDescription(t *testing.T) {
+	restore := git.SetOps(&git.MockOps{
+		LogRangeFn: func(string, string) ([]git.CommitInfo, error) {
+			return []git.CommitInfo{{Subject: "New title"}}, nil
+		},
+	})
+	defer restore()
+	pr := &github.PullRequest{Title: "Old title", Body: "Keep this description"}
+
+	title, body, ok := existingPRTitleBody("main", "branch", pr, &submitOptions{only: true})
+
+	assert.True(t, ok)
+	assert.Equal(t, "New title", title)
+	assert.Equal(t, "Keep this description", body)
+	_, _, ok = existingPRTitleBody("main", "branch", pr, &submitOptions{})
+	assert.False(t, ok, "unscoped submit must not replace PR metadata")
+}
+
+func TestSubmitBranchRange(t *testing.T) {
 	s := &stack.Stack{
 		Trunk: stack.BranchRef{Branch: "main"},
 		Branches: []stack.BranchRef{
@@ -2736,17 +2840,88 @@ func TestSubmitBranchIndices(t *testing.T) {
 	}
 
 	t.Run("whole stack remains the CLI default", func(t *testing.T) {
-		assert.Equal(t, map[int]struct{}{0: {}, 1: {}, 2: {}},
-			submitBranchIndices(s, "two", &submitOptions{}))
+		start, end, err := submitBranchRange(s, "two", &submitOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 0, start)
+		assert.Equal(t, 3, end)
 	})
 
 	t.Run("only selects the requested branch", func(t *testing.T) {
-		assert.Equal(t, map[int]struct{}{1: {}},
-			submitBranchIndices(s, "two", &submitOptions{only: true}))
+		start, end, err := submitBranchRange(s, "two", &submitOptions{only: true})
+		require.NoError(t, err)
+		assert.Equal(t, 1, start)
+		assert.Equal(t, 2, end)
 	})
 
 	t.Run("dependents selects the requested branch and branches above it", func(t *testing.T) {
-		assert.Equal(t, map[int]struct{}{1: {}, 2: {}},
-			submitBranchIndices(s, "two", &submitOptions{dependents: true}))
+		start, end, err := submitBranchRange(s, "two", &submitOptions{dependents: true})
+		require.NoError(t, err)
+		assert.Equal(t, 1, start)
+		assert.Equal(t, 3, end)
 	})
+
+	t.Run("scope requires a stack branch", func(t *testing.T) {
+		_, _, err := submitBranchRange(s, "main", &submitOptions{only: true})
+		assert.ErrorContains(t, err, "not a stack branch")
+	})
+}
+
+func TestDesiredPRTitleBody_RenameUsesNewStackNameAndOldDescription(t *testing.T) {
+	mock := &git.MockOps{
+		LogRangeFn: func(string, string) ([]git.CommitInfo, error) {
+			return []git.CommitInfo{{Subject: "first"}, {Subject: "second"}}, nil
+		},
+	}
+	restore := git.SetOps(mock)
+	defer restore()
+
+	oldBody := "Keep this authored description\n\n---\n\n" + generatePRBody("", "")
+	opts := &submitOptions{renameSources: map[string]*renameSource{
+		"new-stack-name": {
+			OldBranch: "old-stack-name",
+			Body:      oldBody,
+		},
+	}}
+
+	title, body := desiredPRTitleBody("main", "new-stack-name", opts, "")
+
+	assert.Equal(t, "new stack name", title)
+	assert.Contains(t, body, "Keep this authored description")
+	assert.Equal(t, 1, strings.Count(body, "GitHub Stacks CLI"))
+}
+
+func TestPendingRenameSources_RestoresOldPRAssociation(t *testing.T) {
+	gitDir := t.TempDir()
+	before := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{{
+			Branch:      "old-name",
+			PullRequest: &stack.PullRequestRef{Number: 42},
+		}},
+	}
+	metadata, err := json.Marshal(before)
+	require.NoError(t, err)
+	require.NoError(t, modify.SaveState(gitDir, &modify.StateFile{
+		SchemaVersion: 1,
+		Phase:         modify.PhasePendingSubmit,
+		Snapshot:      modify.Snapshot{StackMetadata: metadata},
+		Plan: []modify.Action{{
+			Type:    "rename",
+			Branch:  "old-name",
+			NewName: "new-name",
+		}},
+	}))
+	client := &github.MockClient{
+		FindPRByNumberFn: func(number int) (*github.PullRequest, error) {
+			assert.Equal(t, 42, number)
+			return &github.PullRequest{Number: 42, Title: "Old title", Body: "Old body"}, nil
+		},
+	}
+
+	sources, err := pendingRenameSources(gitDir, client)
+
+	require.NoError(t, err)
+	require.Contains(t, sources, "new-name")
+	assert.Equal(t, "old-name", sources["new-name"].OldBranch)
+	assert.Equal(t, "Old body", sources["new-name"].Body)
 }

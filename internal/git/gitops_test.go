@@ -97,8 +97,23 @@ func remoteBranchSHA(t *testing.T, bareDir, branch string) string {
 }
 
 // ---------------------------------------------------------------------------
-// Integration tests for FetchBranches + Push (force-with-lease)
+// Integration tests for remote branch operations
 // ---------------------------------------------------------------------------
+
+func TestIntegration_DeleteRemoteBranchIsIdempotent(t *testing.T) {
+	bareDir, cloneDir := setupBareAndClone(t)
+	restore := withGitDir(t, cloneDir)
+	defer restore()
+
+	gitExec(t, cloneDir, "checkout", "-b", "old-name")
+	gitExec(t, cloneDir, "push", "origin", "old-name")
+	d := &defaultOps{}
+
+	require.NoError(t, d.DeleteRemoteBranch("origin", "old-name"))
+	require.NoError(t, d.DeleteRemoteBranch("origin", "old-name"))
+	out := gitExec(t, cloneDir, "ls-remote", "--heads", bareDir, "refs/heads/old-name")
+	assert.Empty(t, out)
+}
 
 // Test 1: Branch exists remotely with a current tracking ref.
 // Push should succeed and update the remote.

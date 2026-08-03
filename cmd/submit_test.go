@@ -337,6 +337,60 @@ func TestSubmit_OpenFlag_ConvertsDraftPRs(t *testing.T) {
 	assert.Contains(t, output, "Marked PR")
 }
 
+func TestSubmit_DraftFlag_ConvertsOpenPRs(t *testing.T) {
+	s := stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{Branch: "b1", PullRequest: &stack.PullRequestRef{Number: 10, ID: "PR_10"}},
+		},
+	}
+
+	tmpDir := t.TempDir()
+	writeStackFile(t, tmpDir, s)
+
+	var markedDraft []string
+
+	mock := newSubmitMock(tmpDir, "b1")
+	mock.PushFn = func(string, []string, bool, bool) error { return nil }
+	mock.LogRangeFn = func(base, head string) ([]git.CommitInfo, error) {
+		return []git.CommitInfo{{Subject: "commit for " + head}}, nil
+	}
+	restore := git.SetOps(mock)
+	defer restore()
+
+	cfg, _, errR := config.NewTestConfig()
+	cfg.GitHubClientOverride = &github.MockClient{
+		ListStacksFn: func() ([]github.RemoteStack, error) { return nil, nil },
+		FindPRForBranchFn: func(branch string) (*github.PullRequest, error) {
+			return &github.PullRequest{
+				Number: 10, ID: "PR_10", HeadRefName: branch, BaseRefName: "main",
+				IsDraft: false, URL: "https://github.com/o/r/pull/10",
+			}, nil
+		},
+		MarkPRDraftFn: func(prID string) error {
+			markedDraft = append(markedDraft, prID)
+			return nil
+		},
+		CreateStackFn: func([]int) (*github.RemoteStack, error) {
+			return &github.RemoteStack{ID: 1, Number: 1}, nil
+		},
+	}
+
+	cmd := SubmitCmd(cfg)
+	cmd.SetArgs([]string{"--auto", "--draft"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	err := cmd.Execute()
+
+	cfg.Err.Close()
+	errOut, _ := io.ReadAll(errR)
+	output := string(errOut)
+
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"PR_10"}, markedDraft, "existing open PR should be marked draft")
+	assert.Contains(t, output, "Marked PR")
+}
+
 func TestSubmit_PushFailure(t *testing.T) {
 	s := stack.Stack{
 		Trunk: stack.BranchRef{Branch: "main"},

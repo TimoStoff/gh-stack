@@ -23,6 +23,7 @@ import (
 type submitOptions struct {
 	auto   bool
 	open   bool
+	draft  bool
 	remote string
 	branch string
 }
@@ -53,7 +54,7 @@ This command performs several steps:
 
 In the editor, new PRs default to ready for review; switch any to draft with the
 "CREATE AS" toggle. With --auto, new PRs are created as drafts unless you pass
---open.`,
+--open. Pass --draft to also convert existing open PRs back to draft.`,
 		Example: `  # Push and create/update PRs (opens the interactive editor)
   $ gh stack submit
 
@@ -61,7 +62,10 @@ In the editor, new PRs default to ready for review; switch any to draft with the
   $ gh stack submit --auto
 
   # Mark new and existing PRs as ready for review
-  $ gh stack submit --open`,
+  $ gh stack submit --open
+
+  # Mark new and existing PRs as drafts
+  $ gh stack submit --draft`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSubmit(cfg, opts)
 		},
@@ -69,6 +73,8 @@ In the editor, new PRs default to ready for review; switch any to draft with the
 
 	cmd.Flags().BoolVar(&opts.auto, "auto", false, "Use auto-generated PR titles without prompting")
 	cmd.Flags().BoolVar(&opts.open, "open", false, "Mark new and existing PRs as ready for review")
+	cmd.Flags().BoolVar(&opts.draft, "draft", false, "Mark new and existing PRs as drafts")
+	cmd.MarkFlagsMutuallyExclusive("open", "draft")
 	cmd.Flags().StringVar(&opts.remote, "remote", "", "Remote to push to (defaults to auto-detected remote)")
 	cmd.Flags().StringVar(&opts.branch, "branch", "", "Submit the stack that owns this branch")
 
@@ -427,8 +433,15 @@ func ensurePR(cfg *config.Config, client github.ClientOps, s *stack.Stack, i int
 		cfg.Successf("Updated title and description for PR %s", cfg.PRLink(pr.Number, pr.URL))
 	}
 
-	// Convert draft PR to ready for review when --open is set.
-	if opts.open && pr.IsDraft {
+	// Explicit state flags apply to existing PRs as well as newly created ones.
+	if opts.draft && !pr.IsDraft {
+		if err := client.MarkPRDraft(pr.ID); err != nil {
+			cfg.Warningf("failed to mark PR %s as draft: %v",
+				cfg.PRLink(pr.Number, pr.URL), err)
+			return err
+		}
+		cfg.Successf("Marked PR %s as draft", cfg.PRLink(pr.Number, pr.URL))
+	} else if opts.open && pr.IsDraft {
 		if err := client.MarkPRReadyForReview(pr.ID); err != nil {
 			cfg.Warningf("failed to mark PR %s as ready for review: %v",
 				cfg.PRLink(pr.Number, pr.URL), err)

@@ -251,6 +251,33 @@ func (c *Client) MarkPRReadyForReview(prID string) error {
 	return nil
 }
 
+// MarkPRDraft converts a ready-for-review pull request back to draft.
+func (c *Client) MarkPRDraft(prID string) error {
+	var mutation struct {
+		ConvertPullRequestToDraft struct {
+			PullRequest struct {
+				ID string
+			}
+		} `graphql:"convertPullRequestToDraft(input: $input)"`
+	}
+
+	type ConvertPullRequestToDraftInput struct {
+		PullRequestID string `json:"pullRequestId"`
+	}
+
+	variables := map[string]interface{}{
+		"input": ConvertPullRequestToDraftInput{
+			PullRequestID: prID,
+		},
+	}
+
+	if err := c.gql.Mutate("ConvertPullRequestToDraft", &mutation, variables); err != nil {
+		return fmt.Errorf("marking PR as draft: %w", err)
+	}
+
+	return nil
+}
+
 // DisableAutoMerge disables auto-merge on a pull request.
 func (c *Client) DisableAutoMerge(prID string) error {
 	var mutation struct {

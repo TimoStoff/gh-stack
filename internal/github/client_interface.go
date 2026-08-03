@@ -11,6 +11,7 @@ type ClientOps interface {
 	UpdatePRBase(number int, base string) error
 	UpdatePRTitleBody(number int, title, body string) error
 	MarkPRReadyForReview(prID string) error
+	MarkPRDraft(prID string) error
 	DisableAutoMerge(prID string) error
 	ListStacks() ([]RemoteStack, error)
 	FindStackForPR(prNumber int) (*RemoteStack, error)

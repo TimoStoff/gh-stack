@@ -2724,3 +2724,29 @@ func TestEnsurePR_UpdatesExistingTitleAndBody(t *testing.T) {
 	assert.Equal(t, "New title", gotTitle)
 	assert.Contains(t, gotBody, "New description")
 }
+
+func TestSubmitBranchIndices(t *testing.T) {
+	s := &stack.Stack{
+		Trunk: stack.BranchRef{Branch: "main"},
+		Branches: []stack.BranchRef{
+			{Branch: "one"},
+			{Branch: "two"},
+			{Branch: "three"},
+		},
+	}
+
+	t.Run("whole stack remains the CLI default", func(t *testing.T) {
+		assert.Equal(t, map[int]struct{}{0: {}, 1: {}, 2: {}},
+			submitBranchIndices(s, "two", &submitOptions{}))
+	})
+
+	t.Run("only selects the requested branch", func(t *testing.T) {
+		assert.Equal(t, map[int]struct{}{1: {}},
+			submitBranchIndices(s, "two", &submitOptions{only: true}))
+	})
+
+	t.Run("dependents selects the requested branch and branches above it", func(t *testing.T) {
+		assert.Equal(t, map[int]struct{}{1: {}, 2: {}},
+			submitBranchIndices(s, "two", &submitOptions{dependents: true}))
+	})
+}

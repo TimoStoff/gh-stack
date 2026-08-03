@@ -21,11 +21,13 @@ import (
 )
 
 type submitOptions struct {
-	auto   bool
-	open   bool
-	draft  bool
-	remote string
-	branch string
+	auto       bool
+	open       bool
+	draft      bool
+	remote     string
+	branch     string
+	only       bool
+	dependents bool
 }
 
 func SubmitCmd(cfg *config.Config) *cobra.Command {
@@ -65,7 +67,11 @@ In the editor, new PRs default to ready for review; switch any to draft with the
   $ gh stack submit --open
 
   # Mark new and existing PRs as drafts
-  $ gh stack submit --draft`,
+  $ gh stack submit --draft
+
+  # Submit only one branch, or it and every branch that depends on it
+  $ gh stack submit --branch feature-2 --only
+  $ gh stack submit --branch feature-2 --dependents`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runSubmit(cfg, opts)
 		},
@@ -77,6 +83,9 @@ In the editor, new PRs default to ready for review; switch any to draft with the
 	cmd.MarkFlagsMutuallyExclusive("open", "draft")
 	cmd.Flags().StringVar(&opts.remote, "remote", "", "Remote to push to (defaults to auto-detected remote)")
 	cmd.Flags().StringVar(&opts.branch, "branch", "", "Submit the stack that owns this branch")
+	cmd.Flags().BoolVar(&opts.only, "only", false, "Submit only the selected branch (current branch unless --branch is set)")
+	cmd.Flags().BoolVar(&opts.dependents, "dependents", false, "Submit the selected branch and all branches that depend on it")
+	cmd.MarkFlagsMutuallyExclusive("only", "dependents")
 
 	return cmd
 }
@@ -120,6 +129,7 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 		return ErrDisambiguate
 	}
 	s := stacks[0]
+	submitIndices := submitBranchIndices(s, targetBranch, opts)
 
 	client, err := cfg.GitHubClient()
 	if err != nil {
@@ -179,7 +189,7 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	if len(queued) > 0 {
 		cfg.Printf("Skipping %d queued %s", len(queued), plural(len(queued), "branch", "branches"))
 	}
-	activeBranches := activeBranchNames(s)
+	activeBranches := activeBranchNamesAtIndices(s, submitIndices)
 	if len(activeBranches) == 0 {
 		cfg.Printf("All branches are merged or queued, nothing to submit")
 		return nil
@@ -234,6 +244,9 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	cfg.Printf("Pushing to %s...", remote)
 	prFailures := 0
 	for i, b := range s.Branches {
+		if _, selected := submitIndices[i]; !selected {
+			continue
+		}
 		if s.Branches[i].IsMerged() || s.Branches[i].IsQueued() {
 			continue
 		}
@@ -277,8 +290,36 @@ func runSubmit(cfg *config.Config, opts *submitOptions) error {
 	if err := stack.Save(gitDir, sf); err != nil {
 		return handleSaveError(cfg, err)
 	}
-	cfg.Successf("Pushed and synced %d branches", len(s.ActiveBranches()))
+	cfg.Successf("Pushed and synced %d branches", len(activeBranches))
 	return nil
+}
+
+// submitBranchIndices resolves the requested submit scope. With no scope flag,
+// gh-stack retains its historical whole-stack behavior. --only selects exactly
+// the requested branch, while --dependents also selects every branch above it.
+func submitBranchIndices(s *stack.Stack, targetBranch string, opts *submitOptions) map[int]struct{} {
+	selected := make(map[int]struct{})
+	start, end := 0, len(s.Branches)
+	if opts.only || opts.dependents {
+		start = s.IndexOf(targetBranch)
+		if opts.only {
+			end = start + 1
+		}
+	}
+	for i := start; i >= 0 && i < end; i++ {
+		selected[i] = struct{}{}
+	}
+	return selected
+}
+
+func activeBranchNamesAtIndices(s *stack.Stack, indices map[int]struct{}) []string {
+	branches := make([]string, 0, len(indices))
+	for i, b := range s.Branches {
+		if _, selected := indices[i]; selected && !b.IsSkipped() {
+			branches = append(branches, b.Branch)
+		}
+	}
+	return branches
 }
 
 func findSubmitStacks(sf *stack.StackFile, branch string, requireOwnership bool) []*stack.Stack {
